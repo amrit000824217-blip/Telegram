@@ -1,0 +1,29 @@
+name: Daily Telegram Link Update
+
+on:
+  schedule:
+    - cron: "30 3 * * *"
+
+  workflow_dispatch:
+
+jobs:
+  update-links:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Update Telegram links
+        env:
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+          UPDATE_SECRET: ${{ secrets.UPDATE_SECRET }}
+
+        run: |
+          if [ -z "$RENDER_URL" ] || [ -z "$UPDATE_SECRET" ]; then
+            echo "Missing GitHub repository secrets."
+            exit 1
+          fi
+
+          curl --fail-with-body \
+            --max-time 110 \
+            --request POST \
+            "${RENDER_URL%/}/run-update" \
+            --header "Authorization: Bearer ${UPDATE_SECRET}"
