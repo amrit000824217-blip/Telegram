@@ -47,7 +47,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("link_manager")
 
-# Do not log Telegram API URLs containing the bot token.
+# Do not expose Telegram API URLs containing the bot token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -64,7 +64,7 @@ update_lock = None
 
 
 # =========================================================
-# DATABASE CONNECTION
+# DATABASE
 # =========================================================
 
 def db_connect():
@@ -72,11 +72,7 @@ def db_connect():
         raise RuntimeError("DATABASE_URL is missing")
 
     parsed = urlparse(DATABASE_URL)
-
-    params = dict(
-        parse_qsl(parsed.query, keep_blank_values=True)
-    )
-
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
     params.setdefault("sslmode", "require")
 
     secure_url = urlunparse(
@@ -103,10 +99,6 @@ def db_execute(sql, params=(), fetch=None):
             return None
 
 
-# =========================================================
-# DATABASE INITIALIZATION AND MIGRATION
-# =========================================================
-
 def init_db():
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -129,7 +121,8 @@ def init_db():
                 )
             """)
 
-            # Compatible with the existing Neon table.
+            # Keep one row for each source/destination pair.
+            # invite_link stores the most recently published link.
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS managed_posts (
                     source_chat_id TEXT NOT NULL,
@@ -140,15 +133,22 @@ def init_db():
                 )
             """)
 
-            # Add updated_at if the existing table lacks it.
             cur.execute("""
                 ALTER TABLE managed_posts
                 ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ
                 DEFAULT NOW()
             """)
 
-            # Remove duplicate pairs before creating the unique index.
-            # Keep one row for each source/destination combination.
+            # Separate table: one consolidated post per destination.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS managed_destination_posts (
+                    destination_chat_id TEXT PRIMARY KEY,
+                    message_id BIGINT NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            # Remove duplicate source/destination rows safely.
             cur.execute("""
                 DELETE FROM managed_posts a
                 USING managed_posts b
@@ -166,11 +166,11 @@ def init_db():
                 )
             """)
 
-    logger.info("Database initialized and checked")
+    logger.info("Database initialized")
 
 
 # =========================================================
-# CHAT HELPERS
+# CHAT DATABASE HELPERS
 # =========================================================
 
 def get_chats(table):
@@ -196,7 +196,7 @@ def save_chat(table, chat_id, title, username=None):
             title = EXCLUDED.title,
             username = EXCLUDED.username
         """,
-        (chat_id, title, username),
+        (int(chat_id), title, username),
     )
 
 
@@ -206,23 +206,48 @@ def remove_chat(table, chat_id):
 
     db_execute(
         f"DELETE FROM {table} WHERE chat_id = %s",
-        (chat_id,),
+        (int(chat_id),),
     )
 
 
 # =========================================================
-# MANAGED POSTS
+# CONSOLIDATED POST DATABASE HELPERS
 # =========================================================
 
-def get_managed_post(source_id, destination_id):
+def get_destination_post(destination_id):
     return db_execute(
         """
-        SELECT
-            source_chat_id,
+        SELECT destination_chat_id, message_id, updated_at
+        FROM managed_destination_posts
+        WHERE destination_chat_id = %s
+        """,
+        (str(destination_id),),
+        fetch="one",
+    )
+
+
+def save_destination_post(destination_id, message_id):
+    db_execute(
+        """
+        INSERT INTO managed_destination_posts (
             destination_chat_id,
             message_id,
-            invite_link,
             updated_at
+        )
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (destination_chat_id)
+        DO UPDATE SET
+            message_id = EXCLUDED.message_id,
+            updated_at = NOW()
+        """,
+        (str(destination_id), int(message_id)),
+    )
+
+
+def get_source_link(source_id, destination_id):
+    return db_execute(
+        """
+        SELECT invite_link, message_id
         FROM managed_posts
         WHERE source_chat_id = %s
           AND destination_chat_id = %s
@@ -232,7 +257,7 @@ def get_managed_post(source_id, destination_id):
     )
 
 
-def save_managed_post(
+def save_source_link(
     source_id,
     destination_id,
     message_id,
@@ -248,7 +273,6 @@ def save_managed_post(
             updated_at
         )
         VALUES (%s, %s, %s, %s, NOW())
-
         ON CONFLICT (source_chat_id, destination_chat_id)
         DO UPDATE SET
             message_id = EXCLUDED.message_id,
@@ -283,7 +307,6 @@ async def check_admin(update):
             "Not authorized",
             show_alert=True,
         )
-
     elif update.effective_message:
         await update.effective_message.reply_text(
             "⛔ You are not authorized to use this bot."
@@ -293,7 +316,7 @@ async def check_admin(update):
 
 
 # =========================================================
-# MENUS
+# ADMIN MENUS
 # =========================================================
 
 def main_menu():
@@ -378,7 +401,7 @@ def chat_menu(kind):
 
 
 # =========================================================
-# ADD CHAT
+# ADD SOURCE / DESTINATION
 # =========================================================
 
 async def add_chat_input(update, context):
@@ -432,7 +455,7 @@ async def add_chat_input(update, context):
             table,
             chat.id,
             chat.title or str(chat.id),
-            chat.username,
+            getattr(chat, "username", None),
         )
 
         context.user_data.pop("pending_action", None)
@@ -455,22 +478,119 @@ async def add_chat_input(update, context):
 
 
 # =========================================================
-# POST TEXT
+# POST TEMPLATE
 # =========================================================
 
-def make_post_text(source_title, invite_link):
-    title = html.escape(source_title or "Source Channel")
-    url = html.escape(invite_link, quote=True)
+DISCLAIMER = (
+    "‼️ <b>DISCLAIMER</b> ‼️\n"
+    "&gt;&gt; Here you'll find entertainment, only for fun "
+    "and entertainment purposes. We do not promote any illegal "
+    "activity or explicit material. Content is intended only "
+    "for adults aged 18+."
+)
 
-    return (
-        f"📢 <b>{title}</b>\n\n"
-        f'🔗 <a href="{url}">Join Channel</a>\n\n'
-        f"🔄 <i>Invite link automatically updated.</i>"
+
+def make_post_text(source_links):
+    """
+    source_links:
+        [
+            {"title": "Channel Name", "link": "https://t.me/..."},
+            ...
+        ]
+
+    Each source appears once in the consolidated post.
+    """
+
+    parts = [
+        "╭━━━━━━━━━━━━━━━━━━━━╮",
+        "✨️ <b>𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𝐎𝐔𝐑 𝐂𝐎𝐌𝐌𝐔𝐍𝐈𝐓𝐘</b>",
+        "╰━━━━━━━━━━━━━━━━━━━━╯",
+        "",
+    ]
+
+    for item in source_links:
+        title = html.escape(item["title"] or "Channel")
+        link = html.escape(item["link"], quote=True)
+
+        parts.extend([
+            f"<b>{title}</b>",
+            f'➡️ <a href="{link}">Join Channel</a>',
+            "",
+        ])
+
+    parts.extend([
+        DISCLAIMER,
+        "",
+        "<i>🔄 Links are automatically refreshed.</i>",
+    ])
+
+    return "\n".join(parts)
+
+
+# Telegram message text has a size limit.
+TELEGRAM_MESSAGE_LIMIT = 4000
+
+
+def split_source_groups(source_links):
+    """
+    Split a very large list into chunks that fit Telegram's
+    message limit. Each destination normally has one post.
+    If the content is too long, multiple managed posts are
+    necessary because Telegram limits message length.
+    """
+    groups = []
+    current = []
+
+    for item in source_links:
+        trial = current + [item]
+        text = make_post_text(trial)
+
+        if len(text) > TELEGRAM_MESSAGE_LIMIT and current:
+            groups.append(current)
+            current = [item]
+        else:
+            current = trial
+
+    if current:
+        groups.append(current)
+
+    return groups or [[]]
+
+
+# =========================================================
+# INVITE LINK HELPERS
+# =========================================================
+
+async def create_join_request_link(source_id):
+    invite = await telegram_app.bot.create_chat_invite_link(
+        chat_id=int(source_id),
+        creates_join_request=True,
+        name=datetime.now(timezone.utc).strftime(
+            "Auto-%Y%m%d-%H%M%S"
+        )[:32],
     )
 
+    return invite.invite_link
+
+
+async def revoke_link(source_id, invite_link):
+    if not invite_link:
+        return
+
+    try:
+        await telegram_app.bot.revoke_chat_invite_link(
+            chat_id=int(source_id),
+            invite_link=invite_link,
+        )
+    except TelegramError:
+        logger.warning(
+            "Could not revoke old invite link for source %s",
+            source_id,
+        )
+
 
 # =========================================================
-# PUBLISH / UPDATE LINKS
+# PUBLISH / UPDATE ALL SOURCES IN ONE POST PER DESTINATION
 # =========================================================
 
 async def update_managed_posts():
@@ -492,52 +612,87 @@ async def update_managed_posts():
         if not destinations:
             return "❌ No destination chats configured."
 
-        success = 0
-        failures = []
+        successful_destinations = 0
+        failed_destinations = []
+        total_new_links = 0
 
-        for source in sources:
-            for destination in destinations:
-                source_id = int(source["chat_id"])
-                dest_id = int(destination["chat_id"])
+        # One consolidated post per destination.
+        for destination in destinations:
+            dest_id = int(destination["chat_id"])
 
-                new_link = None
-                post_updated = False
+            new_links = []
+            old_links = []
+            created_links = []
+            post_saved = False
 
-                try:
-                    # Create a new join-request invite link.
-                    invite = await telegram_app.bot.create_chat_invite_link(
-                        chat_id=source_id,
-                        creates_join_request=True,
-                        name=datetime.now(timezone.utc).strftime(
-                            "Auto-%Y%m%d-%H%M"
-                        )[:32],
-                    )
+            try:
+                # 1. Generate one fresh join-request link
+                #    for every source channel.
+                for source in sources:
+                    source_id = int(source["chat_id"])
 
-                    new_link = invite.invite_link
+                    old = get_source_link(source_id, dest_id)
 
-                    old = get_managed_post(source_id, dest_id)
+                    link = await create_join_request_link(source_id)
+                    created_links.append((source_id, link))
 
-                    post_text = make_post_text(
-                        source["title"],
-                        new_link,
-                    )
+                    new_links.append({
+                        "source_id": source_id,
+                        "title": source["title"] or "Channel",
+                        "link": link,
+                        "old_link": old["invite_link"] if old else None,
+                    })
 
-                    if old:
-                        message_id = int(old["message_id"])
+                # 2. Build all source names and links together.
+                groups = split_source_groups(new_links)
 
+                # Normally groups contains one item, so there
+                # will be one consolidated post for this destination.
+                old_destination_post = get_destination_post(dest_id)
+
+                message_ids = []
+
+                for index, group in enumerate(groups):
+                    post_text = make_post_text(group)
+
+                    # Edit the existing consolidated post when possible.
+                    # Additional chunks, if needed, are separate posts
+                    # because of Telegram's message length limit.
+                    existing_message_id = None
+
+                    if index == 0 and old_destination_post:
+                        existing_message_id = int(
+                            old_destination_post["message_id"]
+                        )
+
+                    if existing_message_id:
                         try:
                             await telegram_app.bot.edit_message_text(
                                 chat_id=dest_id,
-                                message_id=message_id,
+                                message_id=existing_message_id,
                                 text=post_text,
                                 parse_mode=ParseMode.HTML,
                                 disable_web_page_preview=True,
                             )
 
-                        except BadRequest as exc:
-                            if "message is not modified" not in str(exc).lower():
-                                raise
+                            message_id = existing_message_id
 
+                        except BadRequest as exc:
+                            if "message is not modified" in str(exc).lower():
+                                message_id = existing_message_id
+                            elif (
+                                "message to edit not found" in str(exc).lower()
+                                or "message can't be edited" in str(exc).lower()
+                            ):
+                                sent = await telegram_app.bot.send_message(
+                                    chat_id=dest_id,
+                                    text=post_text,
+                                    parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True,
+                                )
+                                message_id = sent.message_id
+                            else:
+                                raise
                     else:
                         sent = await telegram_app.bot.send_message(
                             chat_id=dest_id,
@@ -545,68 +700,75 @@ async def update_managed_posts():
                             parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True,
                         )
-
                         message_id = sent.message_id
 
-                    # The new link is now published or the existing
-                    # post already contains the same content.
-                    post_updated = True
+                    message_ids.append(message_id)
 
-                    save_managed_post(
-                        source_id,
+                # 3. Save the consolidated post ID and new links.
+                #    Do not revoke old links until the post is published
+                #    and the database writes have succeeded.
+                primary_message_id = message_ids[0]
+
+                save_destination_post(
+                    dest_id,
+                    primary_message_id,
+                )
+
+                for item in new_links:
+                    save_source_link(
+                        item["source_id"],
                         dest_id,
-                        message_id,
-                        new_link,
+                        primary_message_id,
+                        item["link"],
                     )
 
-                    # Revoke the old link only after the database save.
-                    if old and old["invite_link"] != new_link:
-                        try:
-                            await telegram_app.bot.revoke_chat_invite_link(
-                                chat_id=source_id,
-                                invite_link=old["invite_link"],
-                            )
-                        except TelegramError:
-                            logger.warning(
-                                "Old invite link revocation failed "
-                                "for source %s",
-                                source_id,
-                            )
+                    if item["old_link"] and item["old_link"] != item["link"]:
+                        old_links.append((
+                            item["source_id"],
+                            item["old_link"],
+                        ))
 
-                    success += 1
+                post_saved = True
+                total_new_links += len(new_links)
+                successful_destinations += 1
 
-                except Exception as exc:
-                    logger.exception(
-                        "Publish failed: source=%s destination=%s",
-                        source_id,
-                        dest_id,
-                    )
+                # 4. Revoke old links only after the new post
+                #    and database records have been saved.
+                for source_id, old_link in old_links:
+                    await revoke_link(source_id, old_link)
 
-                    # Do not leave an unused newly created link active.
-                    if new_link and not post_updated:
-                        try:
-                            await telegram_app.bot.revoke_chat_invite_link(
-                                chat_id=source_id,
-                                invite_link=new_link,
-                            )
-                        except TelegramError:
-                            pass
+                logger.info(
+                    "Consolidated post updated for destination %s",
+                    dest_id,
+                )
 
-                    failures.append(
-                        f"{source['title']} -> {destination['title']}: "
-                        f"{str(exc)[:120]}"
-                    )
+            except Exception as exc:
+                logger.exception(
+                    "Destination update failed: %s",
+                    dest_id,
+                )
+
+                # If publishing failed, revoke newly created links
+                # that were not successfully saved/published.
+                if not post_saved:
+                    for source_id, link in created_links:
+                        await revoke_link(source_id, link)
+
+                failed_destinations.append(
+                    f"{destination['title']}: {str(exc)[:160]}"
+                )
 
         result = (
             "🔄 <b>Update Complete</b>\n\n"
-            f"✅ Successful: {success}\n"
-            f"❌ Failed: {len(failures)}"
+            f"📤 Destinations updated: {successful_destinations}\n"
+            f"🔗 New links generated: {total_new_links}\n"
+            f"❌ Failed destinations: {len(failed_destinations)}"
         )
 
-        if failures:
+        if failed_destinations:
             result += "\n\n<b>Errors:</b>\n" + "\n".join(
                 html.escape(item)
-                for item in failures[:8]
+                for item in failed_destinations[:8]
             )
 
         return result
@@ -618,36 +780,35 @@ async def update_managed_posts():
 
 async def daily_update_loop():
     """
-    Run one automatic update per day, shortly after midnight UTC.
-    Manual updates can still be triggered from the admin menu.
+    Attempt an update shortly after midnight UTC each day.
+    The Render service must be awake for this in-process task
+    to run at the scheduled time.
     """
+
     while True:
         now = datetime.now(timezone.utc)
 
-        next_run = (
-            now.replace(
-                hour=0,
-                minute=10,
-                second=0,
-                microsecond=0,
-            )
-            + timedelta(days=1)
+        next_run = now.replace(
+            hour=0,
+            minute=10,
+            second=0,
+            microsecond=0,
         )
 
-        seconds = max(
-            1,
-            (next_run - now).total_seconds(),
-        )
+        if next_run <= now:
+            next_run += timedelta(days=1)
 
-        await asyncio.sleep(seconds)
+        await asyncio.sleep(
+            max(1, (next_run - now).total_seconds())
+        )
 
         try:
-            logger.info("Starting scheduled daily update")
+            logger.info("Starting daily automatic update")
             result = await update_managed_posts()
             logger.info("Daily update result: %s", result)
 
         except Exception:
-            logger.exception("Daily update failed")
+            logger.exception("Daily automatic update failed")
 
 
 # =========================================================
@@ -671,10 +832,14 @@ async def help_command(update, context):
     await update.effective_message.reply_text(
         "ℹ️ Help\n\n"
         "/start — Open admin menu\n"
-        "/status — Check status\n"
-        "/publish — Publish/update links\n\n"
-        "Add source and destination chats using the buttons. "
-        "The bot must be admin in all managed chats.",
+        "/status — Check bot status\n"
+        "/publish — Publish/update all links\n\n"
+        "1. Add source channels.\n"
+        "2. Add destination chats.\n"
+        "3. Make the bot admin in every chat.\n"
+        "4. Use Publish / Update.\n\n"
+        "All source links are combined into one destination post "
+        "unless the message exceeds Telegram's length limit.",
         reply_markup=main_menu(),
     )
 
@@ -699,7 +864,8 @@ async def publish_command(update, context):
         return
 
     await update.effective_message.reply_text(
-        "⚠️ Generate new invite links and update posts?",
+        "⚠️ Generate fresh join-request links and update "
+        "the consolidated destination posts?",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 "✅ Confirm",
@@ -791,7 +957,8 @@ async def button_handler(update, context):
 
     if data == "publish_confirm":
         await query.edit_message_text(
-            "⚠️ Create fresh join-request links and update managed posts?",
+            "⚠️ Generate new join-request links and update "
+            "the consolidated posts?",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "✅ Run Update",
@@ -807,7 +974,7 @@ async def button_handler(update, context):
 
     if data == "publish_run":
         await query.edit_message_text(
-            "⏳ Updating links. Please wait..."
+            "⏳ Updating links and consolidated posts. Please wait..."
         )
 
         try:
@@ -848,9 +1015,10 @@ async def button_handler(update, context):
             "ℹ️ Help\n\n"
             "1. Add source channels.\n"
             "2. Add destination chats.\n"
-            "3. Make the bot an admin in each chat.\n"
+            "3. Make the bot an admin in every chat.\n"
             "4. Select Publish / Update.\n\n"
-            "Links use join-request approval.",
+            "All links are join-request links. The bot updates "
+            "the consolidated destination post automatically.",
             reply_markup=main_menu(),
         )
 
@@ -881,25 +1049,11 @@ async def start_telegram():
     application = Application.builder().token(BOT_TOKEN).build()
     telegram_app = application
 
-    application.add_handler(
-        CommandHandler("start", start_command)
-    )
-
-    application.add_handler(
-        CommandHandler("help", help_command)
-    )
-
-    application.add_handler(
-        CommandHandler("status", status_command)
-    )
-
-    application.add_handler(
-        CommandHandler("publish", publish_command)
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(button_handler)
-    )
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("publish", publish_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
 
     application.add_handler(
         MessageHandler(
@@ -910,7 +1064,7 @@ async def start_telegram():
 
     await application.initialize()
 
-    # Remove an old webhook before enabling polling.
+    # Remove any old webhook before starting polling.
     await application.bot.delete_webhook(
         drop_pending_updates=False
     )
@@ -927,7 +1081,6 @@ async def start_telegram():
 
     bot_ready = True
 
-    # Start the daily update task on the same asyncio loop.
     application.create_task(daily_update_loop())
 
     logger.info("BOT_READY: Long polling started successfully")
