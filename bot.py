@@ -4,6 +4,7 @@ import html
 import asyncio
 import logging
 import threading
+
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
@@ -22,27 +23,19 @@ from telegram.ext import (
     filters,
 )
 
+
 # =========================================================
 # CONFIGURATION
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-BASE_URL = (
-    os.getenv("WEBHOOK_URL")
-    or os.getenv("RENDER_EXTERNAL_URL")
-    or ""
-).strip().rstrip("/")
-
 UPDATE_SECRET = os.getenv("UPDATE_SECRET", "").strip()
 
-WEBHOOK_SECRET = re.sub(
-    r"[^A-Za-z0-9_-]",
-    "",
-    os.getenv("WEBHOOK_SECRET", ""),
-)[:256]
+try:
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+except ValueError:
+    ADMIN_ID = 0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,15 +44,21 @@ logging.basicConfig(
 
 logger = logging.getLogger("link_manager")
 
+# Avoid logging Telegram API URLs containing the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 app = Flask(__name__)
 
 telegram_app = None
 bot_loop = None
+
 bot_ready = False
 startup_error = None
 
 startup_lock = threading.Lock()
 startup_started = False
+
 update_lock = None
 
 
@@ -72,7 +71,11 @@ def db_connect():
         raise RuntimeError("DATABASE_URL is missing")
 
     parsed = urlparse(DATABASE_URL)
-    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+
+    params = dict(
+        parse_qsl(parsed.query, keep_blank_values=True)
+    )
+
     params.setdefault("sslmode", "require")
 
     secure_url = urlunparse(
@@ -184,7 +187,12 @@ def get_managed_post(source_id, destination_id):
     )
 
 
-def save_managed_post(source_id, destination_id, message_id, invite_url):
+def save_managed_post(
+    source_id,
+    destination_id,
+    message_id,
+    invite_url,
+):
     db_execute(
         """
         INSERT INTO managed_posts
@@ -196,12 +204,17 @@ def save_managed_post(source_id, destination_id, message_id, invite_url):
             invite_url = EXCLUDED.invite_url,
             updated_at = NOW()
         """,
-        (source_id, destination_id, message_id, invite_url),
+        (
+            source_id,
+            destination_id,
+            message_id,
+            invite_url,
+        ),
     )
 
 
 # =========================================================
-# ADMIN CHECK
+# ADMIN
 # =========================================================
 
 def is_admin(user_id):
@@ -331,8 +344,15 @@ async def add_chat_input(update, context):
     if not argument:
         return
 
+    # Convert numeric IDs into integers.
+    chat_reference = (
+        int(argument)
+        if re.fullmatch(r"-?\d+", argument)
+        else argument
+    )
+
     try:
-        chat = await context.bot.get_chat(argument)
+        chat = await context.bot.get_chat(chat_reference)
 
         if chat.type not in ("channel", "group", "supergroup"):
             await message.reply_text(
@@ -378,8 +398,8 @@ async def add_chat_input(update, context):
 
         await message.reply_text(
             "❌ Chat add nahi hua.\n"
-            f"Error: {str(exc)[:250]}\n\n"
-            "Private channel ke liye numeric ID use karo. "
+            f"Error: {str(exc)[:200]}\n\n"
+            "Username ya numeric chat ID check karo. "
             "Bot ko chat mein admin bhi banao."
         )
 
@@ -403,7 +423,7 @@ async def update_managed_posts():
     global update_lock
 
     if telegram_app is None:
-        raise RuntimeError("Telegram app is not initialized")
+        raise RuntimeError("Telegram application is not initialized")
 
     if update_lock is None:
         update_lock = asyncio.Lock()
@@ -430,6 +450,7 @@ async def update_managed_posts():
                 post_updated = False
 
                 try:
+                    # Create a fresh join-request invite link.
                     invite = await telegram_app.bot.create_chat_invite_link(
                         chat_id=source_id,
                         creates_join_request=True,
@@ -439,6 +460,7 @@ async def update_managed_posts():
                     )
 
                     new_link = invite.invite_link
+
                     old = get_managed_post(source_id, dest_id)
 
                     text = make_post_text(
@@ -457,9 +479,11 @@ async def update_managed_posts():
                                 parse_mode=ParseMode.HTML,
                                 disable_web_page_preview=True,
                             )
+
                         except BadRequest as exc:
                             if "message is not modified" not in str(exc).lower():
                                 raise
+
                     else:
                         sent = await telegram_app.bot.send_message(
                             chat_id=dest_id,
@@ -467,6 +491,7 @@ async def update_managed_posts():
                             parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True,
                         )
+
                         message_id = sent.message_id
 
                     post_updated = True
@@ -478,6 +503,7 @@ async def update_managed_posts():
                         new_link,
                     )
 
+                    # Revoke old link only after the new post/link is saved.
                     if old and old["invite_url"] != new_link:
                         try:
                             await telegram_app.bot.revoke_chat_invite_link(
@@ -486,7 +512,7 @@ async def update_managed_posts():
                             )
                         except TelegramError:
                             logger.warning(
-                                "Could not revoke old invite link for %s",
+                                "Could not revoke old invite link for source %s",
                                 source_id,
                             )
 
@@ -499,6 +525,7 @@ async def update_managed_posts():
                         dest_id,
                     )
 
+                    # Revoke newly created link if it was never published.
                     if new_link and not post_updated:
                         try:
                             await telegram_app.bot.revoke_chat_invite_link(
@@ -521,7 +548,8 @@ async def update_managed_posts():
 
         if failures:
             result += "\n\n<b>Errors:</b>\n" + "\n".join(
-                html.escape(item) for item in failures[:8]
+                html.escape(item)
+                for item in failures[:8]
             )
 
         return result
@@ -606,6 +634,7 @@ async def button_handler(update, context):
 
     if data == "home":
         context.user_data.pop("pending_action", None)
+
         await query.edit_message_text(
             "🤖 Telegram Link Manager",
             reply_markup=main_menu(),
@@ -624,6 +653,7 @@ async def button_handler(update, context):
 
     if data == "add_source":
         context.user_data["pending_action"] = "source"
+
         await query.edit_message_text(
             "📥 Send source channel ID or public @username.\n\n"
             "Bot ko source channel mein admin banao.",
@@ -633,6 +663,7 @@ async def button_handler(update, context):
 
     if data == "add_destination":
         context.user_data["pending_action"] = "destination"
+
         await query.edit_message_text(
             "📤 Send destination channel/group ID or @username.\n\n"
             "Bot ko destination mein admin banao.",
@@ -643,7 +674,9 @@ async def button_handler(update, context):
     if data.startswith("remove_source:"):
         chat_id = int(data.split(":", 1)[1])
         remove_chat("source_chats", chat_id)
+
         title, keyboard = chat_menu("source")
+
         await query.edit_message_text(
             "✅ Source configuration removed.\n\n" + title,
             reply_markup=keyboard,
@@ -653,7 +686,9 @@ async def button_handler(update, context):
     if data.startswith("remove_destination:"):
         chat_id = int(data.split(":", 1)[1])
         remove_chat("destination_chats", chat_id)
+
         title, keyboard = chat_menu("destination")
+
         await query.edit_message_text(
             "✅ Destination configuration removed.\n\n" + title,
             reply_markup=keyboard,
@@ -677,21 +712,27 @@ async def button_handler(update, context):
         return
 
     if data == "publish_run":
-        await query.edit_message_text("⏳ Updating links. Please wait...")
+        await query.edit_message_text(
+            "⏳ Updating links. Please wait..."
+        )
 
         try:
             result = await update_managed_posts()
+
             await query.edit_message_text(
                 result,
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_menu(),
             )
+
         except Exception:
             logger.exception("Manual update failed")
+
             await query.edit_message_text(
                 "❌ Update failed. Check Render logs.",
                 reply_markup=main_menu(),
             )
+
         return
 
     if data == "status":
@@ -721,7 +762,7 @@ async def button_handler(update, context):
 
 
 # =========================================================
-# STARTUP
+# TELEGRAM APPLICATION STARTUP — LONG POLLING
 # =========================================================
 
 async def start_telegram():
@@ -731,28 +772,36 @@ async def start_telegram():
     startup_error = None
 
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing")
+        raise RuntimeError("BOT_TOKEN environment variable is missing")
 
     if not ADMIN_ID:
-        raise RuntimeError("ADMIN_ID is missing")
+        raise RuntimeError("ADMIN_ID environment variable is missing or invalid")
 
-    if not BASE_URL:
-        raise RuntimeError(
-            "WEBHOOK_URL or RENDER_EXTERNAL_URL is missing"
-        )
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL environment variable is missing")
 
     init_db()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Store the shared object before awaiting initialization.
+    # Assign the shared application before starting its services.
     telegram_app = application
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("publish", publish_command))
-    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(
+        CommandHandler("start", start_command)
+    )
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+    application.add_handler(
+        CommandHandler("status", status_command)
+    )
+    application.add_handler(
+        CommandHandler("publish", publish_command)
+    )
+    application.add_handler(
+        CallbackQueryHandler(button_handler)
+    )
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -761,21 +810,29 @@ async def start_telegram():
     )
 
     await application.initialize()
+
+    # Remove any old webhook so it cannot conflict with polling.
+    await application.bot.delete_webhook(
+        drop_pending_updates=False
+    )
+
+    # Start the update-processing queue.
     await application.start()
 
-    webhook_options = {
-        "url": f"{BASE_URL}/telegram-webhook",
-        "allowed_updates": ["message", "callback_query"],
-        "drop_pending_updates": False,
-    }
+    if application.updater is None:
+        raise RuntimeError("Telegram updater is unavailable")
 
-    if WEBHOOK_SECRET:
-        webhook_options["secret_token"] = WEBHOOK_SECRET
-
-    await application.bot.set_webhook(**webhook_options)
+    # Begin receiving updates directly from Telegram.
+    await application.updater.start_polling(
+        allowed_updates=["message", "callback_query"],
+        drop_pending_updates=False,
+    )
 
     bot_ready = True
-    logger.info("BOT_READY: Telegram application and webhook started")
+
+    logger.info(
+        "BOT_READY: Long polling started successfully"
+    )
 
 
 def telegram_thread():
@@ -788,10 +845,12 @@ def telegram_thread():
     try:
         loop.run_until_complete(start_telegram())
         loop.run_forever()
+
     except Exception as exc:
         bot_ready = False
         startup_error = str(exc)
-        logger.exception("Telegram startup failed")
+
+        logger.exception("Telegram startup/runtime failed")
 
 
 def start_background_bot():
@@ -800,13 +859,16 @@ def start_background_bot():
     with startup_lock:
         if startup_started:
             return
+
         startup_started = True
 
-    threading.Thread(
+    thread = threading.Thread(
         target=telegram_thread,
         name="telegram-bot",
         daemon=True,
-    ).start()
+    )
+
+    thread.start()
 
 
 # =========================================================
@@ -821,84 +883,30 @@ def index():
         "bot_ready": bot_ready,
         "startup_error": startup_error,
         "database": "PostgreSQL",
-    })
+        "mode": "long_polling",
+    }), 200
 
 
 @app.get("/health")
 def health():
-    if not bot_ready:
-        return jsonify({
-            "status": "starting",
-            "bot_ready": False,
-            "startup_error": startup_error,
-        }), 503
-
+    # Keep Render health checks independent of bot startup timing.
     return jsonify({
         "status": "ok",
-        "bot_ready": True,
+        "bot_ready": bot_ready,
+        "startup_error": startup_error,
     }), 200
-
-
-@app.post("/telegram-webhook")
-def telegram_webhook():
-    if WEBHOOK_SECRET:
-        received = request.headers.get(
-            "X-Telegram-Bot-Api-Secret-Token",
-            "",
-        )
-
-        if received != WEBHOOK_SECRET:
-            logger.warning("Rejected webhook: invalid secret")
-            return jsonify({"error": "Unauthorized"}), 401
-
-    if (
-        not bot_ready
-        or telegram_app is None
-        or bot_loop is None
-        or not bot_loop.is_running()
-    ):
-        logger.warning(
-            "Webhook unavailable: ready=%s app_exists=%s "
-            "loop_exists=%s loop_running=%s",
-            bot_ready,
-            telegram_app is not None,
-            bot_loop is not None,
-            bot_loop.is_running() if bot_loop is not None else False,
-        )
-
-        return jsonify({"error": "Bot initializing"}), 503
-
-    payload = request.get_json(silent=True)
-
-    if not isinstance(payload, dict):
-        return jsonify({"error": "Invalid JSON"}), 400
-
-    try:
-        telegram_update = Update.de_json(
-            payload,
-            telegram_app.bot,
-        )
-
-        future = asyncio.run_coroutine_threadsafe(
-            telegram_app.update_queue.put(telegram_update),
-            bot_loop,
-        )
-
-        future.result(timeout=10)
-
-        return jsonify({"ok": True}), 200
-
-    except Exception:
-        logger.exception("Webhook enqueue failed")
-        return jsonify({"error": "Webhook processing failed"}), 500
 
 
 @app.post("/run-update")
 def run_update_endpoint():
     if not UPDATE_SECRET:
-        return jsonify({"error": "UPDATE_SECRET missing"}), 503
+        return jsonify({
+            "error": "UPDATE_SECRET environment variable is missing"
+        }), 503
 
-    if request.headers.get("Authorization") != f"Bearer {UPDATE_SECRET}":
+    authorization = request.headers.get("Authorization", "")
+
+    if authorization != f"Bearer {UPDATE_SECRET}":
         return jsonify({"error": "Unauthorized"}), 401
 
     if (
@@ -935,7 +943,7 @@ def run_update_endpoint():
 
 
 # =========================================================
-# START BOT
+# START BOT THREAD
 # =========================================================
 
 start_background_bot()
