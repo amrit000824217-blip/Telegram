@@ -5,27 +5,30 @@ import asyncio
 import logging
 import threading
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
 from flask import Flask, request, jsonify
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import TelegramError, BadRequest
+
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
 
 # =========================================================
-# CONFIGURATION
+# CONFIG
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -44,7 +47,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("link_manager")
 
-# Avoid logging Telegram API URLs containing the bot token.
+# Do not log Telegram API URLs containing the bot token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -52,18 +55,16 @@ app = Flask(__name__)
 
 telegram_app = None
 bot_loop = None
-
 bot_ready = False
 startup_error = None
 
 startup_lock = threading.Lock()
 startup_started = False
-
 update_lock = None
 
 
 # =========================================================
-# DATABASE
+# DATABASE CONNECTION
 # =========================================================
 
 def db_connect():
@@ -102,43 +103,75 @@ def db_execute(sql, params=(), fetch=None):
             return None
 
 
-def init_db():
-    statements = [
-        """
-        CREATE TABLE IF NOT EXISTS source_chats (
-            chat_id BIGINT PRIMARY KEY,
-            title TEXT NOT NULL,
-            username TEXT,
-            added_at TIMESTAMPTZ DEFAULT NOW()
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS destination_chats (
-            chat_id BIGINT PRIMARY KEY,
-            title TEXT NOT NULL,
-            username TEXT,
-            added_at TIMESTAMPTZ DEFAULT NOW()
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS managed_posts (
-            source_id BIGINT NOT NULL,
-            destination_id BIGINT NOT NULL,
-            message_id BIGINT NOT NULL,
-            invite_url TEXT NOT NULL,
-            updated_at TIMESTAMPTZ DEFAULT NOW(),
-            PRIMARY KEY (source_id, destination_id)
-        )
-        """,
-    ]
+# =========================================================
+# DATABASE INITIALIZATION AND MIGRATION
+# =========================================================
 
+def init_db():
     with db_connect() as conn:
         with conn.cursor() as cur:
-            for statement in statements:
-                cur.execute(statement)
 
-    logger.info("Database initialized")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS source_chats (
+                    chat_id BIGINT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    username TEXT,
+                    added_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
 
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS destination_chats (
+                    chat_id BIGINT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    username TEXT,
+                    added_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            # Compatible with the existing Neon table.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS managed_posts (
+                    source_chat_id TEXT NOT NULL,
+                    destination_chat_id TEXT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    invite_link TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            # Add updated_at if the existing table lacks it.
+            cur.execute("""
+                ALTER TABLE managed_posts
+                ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ
+                DEFAULT NOW()
+            """)
+
+            # Remove duplicate pairs before creating the unique index.
+            # Keep one row for each source/destination combination.
+            cur.execute("""
+                DELETE FROM managed_posts a
+                USING managed_posts b
+                WHERE a.source_chat_id = b.source_chat_id
+                  AND a.destination_chat_id = b.destination_chat_id
+                  AND a.ctid < b.ctid
+            """)
+
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                managed_posts_pair_uidx
+                ON managed_posts (
+                    source_chat_id,
+                    destination_chat_id
+                )
+            """)
+
+    logger.info("Database initialized and checked")
+
+
+# =========================================================
+# CHAT HELPERS
+# =========================================================
 
 def get_chats(table):
     if table not in ("source_chats", "destination_chats"):
@@ -158,7 +191,8 @@ def save_chat(table, chat_id, title, username=None):
         f"""
         INSERT INTO {table} (chat_id, title, username)
         VALUES (%s, %s, %s)
-        ON CONFLICT (chat_id) DO UPDATE SET
+        ON CONFLICT (chat_id)
+        DO UPDATE SET
             title = EXCLUDED.title,
             username = EXCLUDED.username
         """,
@@ -176,13 +210,24 @@ def remove_chat(table, chat_id):
     )
 
 
+# =========================================================
+# MANAGED POSTS
+# =========================================================
+
 def get_managed_post(source_id, destination_id):
     return db_execute(
         """
-        SELECT * FROM managed_posts
-        WHERE source_id = %s AND destination_id = %s
+        SELECT
+            source_chat_id,
+            destination_chat_id,
+            message_id,
+            invite_link,
+            updated_at
+        FROM managed_posts
+        WHERE source_chat_id = %s
+          AND destination_chat_id = %s
         """,
-        (source_id, destination_id),
+        (str(source_id), str(destination_id)),
         fetch="one",
     )
 
@@ -191,30 +236,36 @@ def save_managed_post(
     source_id,
     destination_id,
     message_id,
-    invite_url,
+    invite_link,
 ):
     db_execute(
         """
-        INSERT INTO managed_posts
-            (source_id, destination_id, message_id, invite_url)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (source_id, destination_id)
+        INSERT INTO managed_posts (
+            source_chat_id,
+            destination_chat_id,
+            message_id,
+            invite_link,
+            updated_at
+        )
+        VALUES (%s, %s, %s, %s, NOW())
+
+        ON CONFLICT (source_chat_id, destination_chat_id)
         DO UPDATE SET
             message_id = EXCLUDED.message_id,
-            invite_url = EXCLUDED.invite_url,
+            invite_link = EXCLUDED.invite_link,
             updated_at = NOW()
         """,
         (
-            source_id,
-            destination_id,
-            message_id,
-            invite_url,
+            str(source_id),
+            str(destination_id),
+            int(message_id),
+            invite_link,
         ),
     )
 
 
 # =========================================================
-# ADMIN
+# ADMIN CHECK
 # =========================================================
 
 def is_admin(user_id):
@@ -232,6 +283,7 @@ async def check_admin(update):
             "Not authorized",
             show_alert=True,
         )
+
     elif update.effective_message:
         await update.effective_message.reply_text(
             "⛔ You are not authorized to use this bot."
@@ -326,7 +378,7 @@ def chat_menu(kind):
 
 
 # =========================================================
-# ADD SOURCE / DESTINATION
+# ADD CHAT
 # =========================================================
 
 async def add_chat_input(update, context):
@@ -344,7 +396,6 @@ async def add_chat_input(update, context):
     if not argument:
         return
 
-    # Convert numeric IDs into integers.
     chat_reference = (
         int(argument)
         if re.fullmatch(r"-?\d+", argument)
@@ -398,19 +449,18 @@ async def add_chat_input(update, context):
 
         await message.reply_text(
             "❌ Chat add nahi hua.\n"
-            f"Error: {str(exc)[:200]}\n\n"
-            "Username ya numeric chat ID check karo. "
-            "Bot ko chat mein admin bhi banao."
+            f"Error: {str(exc)[:180]}\n\n"
+            "Chat ID/username aur bot admin permissions check karo."
         )
 
 
 # =========================================================
-# INVITE LINKS / PUBLISH
+# POST TEXT
 # =========================================================
 
-def make_post_text(source_title, invite_url):
+def make_post_text(source_title, invite_link):
     title = html.escape(source_title or "Source Channel")
-    url = html.escape(invite_url, quote=True)
+    url = html.escape(invite_link, quote=True)
 
     return (
         f"📢 <b>{title}</b>\n\n"
@@ -418,6 +468,10 @@ def make_post_text(source_title, invite_url):
         f"🔄 <i>Invite link automatically updated.</i>"
     )
 
+
+# =========================================================
+# PUBLISH / UPDATE LINKS
+# =========================================================
 
 async def update_managed_posts():
     global update_lock
@@ -450,7 +504,7 @@ async def update_managed_posts():
                 post_updated = False
 
                 try:
-                    # Create a fresh join-request invite link.
+                    # Create a new join-request invite link.
                     invite = await telegram_app.bot.create_chat_invite_link(
                         chat_id=source_id,
                         creates_join_request=True,
@@ -463,7 +517,7 @@ async def update_managed_posts():
 
                     old = get_managed_post(source_id, dest_id)
 
-                    text = make_post_text(
+                    post_text = make_post_text(
                         source["title"],
                         new_link,
                     )
@@ -475,7 +529,7 @@ async def update_managed_posts():
                             await telegram_app.bot.edit_message_text(
                                 chat_id=dest_id,
                                 message_id=message_id,
-                                text=text,
+                                text=post_text,
                                 parse_mode=ParseMode.HTML,
                                 disable_web_page_preview=True,
                             )
@@ -487,13 +541,15 @@ async def update_managed_posts():
                     else:
                         sent = await telegram_app.bot.send_message(
                             chat_id=dest_id,
-                            text=text,
+                            text=post_text,
                             parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True,
                         )
 
                         message_id = sent.message_id
 
+                    # The new link is now published or the existing
+                    # post already contains the same content.
                     post_updated = True
 
                     save_managed_post(
@@ -503,16 +559,17 @@ async def update_managed_posts():
                         new_link,
                     )
 
-                    # Revoke old link only after the new post/link is saved.
-                    if old and old["invite_url"] != new_link:
+                    # Revoke the old link only after the database save.
+                    if old and old["invite_link"] != new_link:
                         try:
                             await telegram_app.bot.revoke_chat_invite_link(
                                 chat_id=source_id,
-                                invite_link=old["invite_url"],
+                                invite_link=old["invite_link"],
                             )
                         except TelegramError:
                             logger.warning(
-                                "Could not revoke old invite link for source %s",
+                                "Old invite link revocation failed "
+                                "for source %s",
                                 source_id,
                             )
 
@@ -525,7 +582,7 @@ async def update_managed_posts():
                         dest_id,
                     )
 
-                    # Revoke newly created link if it was never published.
+                    # Do not leave an unused newly created link active.
                     if new_link and not post_updated:
                         try:
                             await telegram_app.bot.revoke_chat_invite_link(
@@ -553,6 +610,44 @@ async def update_managed_posts():
             )
 
         return result
+
+
+# =========================================================
+# DAILY AUTOMATIC UPDATE
+# =========================================================
+
+async def daily_update_loop():
+    """
+    Run one automatic update per day, shortly after midnight UTC.
+    Manual updates can still be triggered from the admin menu.
+    """
+    while True:
+        now = datetime.now(timezone.utc)
+
+        next_run = (
+            now.replace(
+                hour=0,
+                minute=10,
+                second=0,
+                microsecond=0,
+            )
+            + timedelta(days=1)
+        )
+
+        seconds = max(
+            1,
+            (next_run - now).total_seconds(),
+        )
+
+        await asyncio.sleep(seconds)
+
+        try:
+            logger.info("Starting scheduled daily update")
+            result = await update_managed_posts()
+            logger.info("Daily update result: %s", result)
+
+        except Exception:
+            logger.exception("Daily update failed")
 
 
 # =========================================================
@@ -593,7 +688,6 @@ async def status_command(update, context):
 
     await update.effective_message.reply_text(
         f"📊 Bot ready: {bot_ready}\n"
-        f"Database: PostgreSQL\n"
         f"Sources: {len(sources)}\n"
         f"Destinations: {len(destinations)}",
         reply_markup=main_menu(),
@@ -762,46 +856,51 @@ async def button_handler(update, context):
 
 
 # =========================================================
-# TELEGRAM APPLICATION STARTUP — LONG POLLING
+# TELEGRAM STARTUP
 # =========================================================
 
 async def start_telegram():
-    global telegram_app, bot_ready, startup_error
+    global telegram_app, bot_ready, startup_error, update_lock
 
     bot_ready = False
     startup_error = None
 
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is missing")
+        raise RuntimeError("BOT_TOKEN is missing")
 
     if not ADMIN_ID:
-        raise RuntimeError("ADMIN_ID environment variable is missing or invalid")
+        raise RuntimeError("ADMIN_ID is missing or invalid")
 
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL environment variable is missing")
+        raise RuntimeError("DATABASE_URL is missing")
 
     init_db()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    update_lock = asyncio.Lock()
 
-    # Assign the shared application before starting its services.
+    application = Application.builder().token(BOT_TOKEN).build()
     telegram_app = application
 
     application.add_handler(
         CommandHandler("start", start_command)
     )
+
     application.add_handler(
         CommandHandler("help", help_command)
     )
+
     application.add_handler(
         CommandHandler("status", status_command)
     )
+
     application.add_handler(
         CommandHandler("publish", publish_command)
     )
+
     application.add_handler(
         CallbackQueryHandler(button_handler)
     )
+
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -811,18 +910,16 @@ async def start_telegram():
 
     await application.initialize()
 
-    # Remove any old webhook so it cannot conflict with polling.
+    # Remove an old webhook before enabling polling.
     await application.bot.delete_webhook(
         drop_pending_updates=False
     )
 
-    # Start the update-processing queue.
     await application.start()
 
     if application.updater is None:
         raise RuntimeError("Telegram updater is unavailable")
 
-    # Begin receiving updates directly from Telegram.
     await application.updater.start_polling(
         allowed_updates=["message", "callback_query"],
         drop_pending_updates=False,
@@ -830,9 +927,10 @@ async def start_telegram():
 
     bot_ready = True
 
-    logger.info(
-        "BOT_READY: Long polling started successfully"
-    )
+    # Start the daily update task on the same asyncio loop.
+    application.create_task(daily_update_loop())
+
+    logger.info("BOT_READY: Long polling started successfully")
 
 
 def telegram_thread():
@@ -849,7 +947,6 @@ def telegram_thread():
     except Exception as exc:
         bot_ready = False
         startup_error = str(exc)
-
         logger.exception("Telegram startup/runtime failed")
 
 
@@ -862,13 +959,11 @@ def start_background_bot():
 
         startup_started = True
 
-    thread = threading.Thread(
+    threading.Thread(
         target=telegram_thread,
         name="telegram-bot",
         daemon=True,
-    )
-
-    thread.start()
+    ).start()
 
 
 # =========================================================
@@ -889,7 +984,6 @@ def index():
 
 @app.get("/health")
 def health():
-    # Keep Render health checks independent of bot startup timing.
     return jsonify({
         "status": "ok",
         "bot_ready": bot_ready,
@@ -901,7 +995,7 @@ def health():
 def run_update_endpoint():
     if not UPDATE_SECRET:
         return jsonify({
-            "error": "UPDATE_SECRET environment variable is missing"
+            "error": "UPDATE_SECRET is missing"
         }), 503
 
     authorization = request.headers.get("Authorization", "")
@@ -943,7 +1037,7 @@ def run_update_endpoint():
 
 
 # =========================================================
-# START BOT THREAD
+# START BACKGROUND BOT
 # =========================================================
 
 start_background_bot()
