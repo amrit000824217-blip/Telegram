@@ -521,7 +521,7 @@ def make_post_text(source_links):
     parts.extend([
         DISCLAIMER,
         "",
-        "<i>🔄 Links are automatically refreshed.</i>",
+        "<i>THANKS FOR JOINING 🔞</i>",
     ])
 
     return "\n".join(parts)
