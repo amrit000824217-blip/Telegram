@@ -11,11 +11,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, request, jsonify
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import TelegramError, BadRequest
 from telegram.ext import (
@@ -23,13 +19,11 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
-    ContextTypes,
     filters,
 )
 
-
 # =========================================================
-# CONFIG
+# CONFIGURATION
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -62,6 +56,7 @@ app = Flask(__name__)
 telegram_app = None
 bot_loop = None
 bot_ready = False
+startup_error = None
 
 startup_lock = threading.Lock()
 startup_started = False
@@ -78,7 +73,6 @@ def db_connect():
 
     parsed = urlparse(DATABASE_URL)
     params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-
     params.setdefault("sslmode", "require")
 
     secure_url = urlunparse(
@@ -207,7 +201,7 @@ def save_managed_post(source_id, destination_id, message_id, invite_url):
 
 
 # =========================================================
-# ADMIN
+# ADMIN CHECK
 # =========================================================
 
 def is_admin(user_id):
@@ -299,7 +293,7 @@ def chat_menu(kind):
     ]]
 
     for chat in get_chats(table):
-        label = (chat["title"] or str(chat["chat_id"]))[:40]
+        label = (chat["title"] or str(chat["chat_id"]))[:35]
 
         rows.append([
             InlineKeyboardButton(
@@ -319,7 +313,7 @@ def chat_menu(kind):
 
 
 # =========================================================
-# ADD CHAT
+# ADD SOURCE / DESTINATION
 # =========================================================
 
 async def add_chat_input(update, context):
@@ -384,17 +378,18 @@ async def add_chat_input(update, context):
 
         await message.reply_text(
             "❌ Chat add nahi hua.\n"
-            f"Error: {str(exc)[:500]}\n\n"
-            "Private channel ke liye numeric ID use karo."
+            f"Error: {str(exc)[:250]}\n\n"
+            "Private channel ke liye numeric ID use karo. "
+            "Bot ko chat mein admin bhi banao."
         )
 
 
 # =========================================================
-# PUBLISH / ROTATE LINKS
+# INVITE LINKS / PUBLISH
 # =========================================================
 
 def make_post_text(source_title, invite_url):
-    title = html.escape(source_title)
+    title = html.escape(source_title or "Source Channel")
     url = html.escape(invite_url, quote=True)
 
     return (
@@ -432,7 +427,7 @@ async def update_managed_posts():
                 dest_id = int(destination["chat_id"])
 
                 new_link = None
-                telegram_post_updated = False
+                post_updated = False
 
                 try:
                     invite = await telegram_app.bot.create_chat_invite_link(
@@ -444,7 +439,6 @@ async def update_managed_posts():
                     )
 
                     new_link = invite.invite_link
-
                     old = get_managed_post(source_id, dest_id)
 
                     text = make_post_text(
@@ -475,7 +469,7 @@ async def update_managed_posts():
                         )
                         message_id = sent.message_id
 
-                    telegram_post_updated = True
+                    post_updated = True
 
                     save_managed_post(
                         source_id,
@@ -484,8 +478,6 @@ async def update_managed_posts():
                         new_link,
                     )
 
-                    # Revoke old link only after the post and database
-                    # record have been updated successfully.
                     if old and old["invite_url"] != new_link:
                         try:
                             await telegram_app.bot.revoke_chat_invite_link(
@@ -494,7 +486,7 @@ async def update_managed_posts():
                             )
                         except TelegramError:
                             logger.warning(
-                                "Could not revoke old link for %s",
+                                "Could not revoke old invite link for %s",
                                 source_id,
                             )
 
@@ -507,9 +499,7 @@ async def update_managed_posts():
                         dest_id,
                     )
 
-                    # Never revoke a link after a successful post edit,
-                    # because the post may already contain that link.
-                    if new_link and not telegram_post_updated:
+                    if new_link and not post_updated:
                         try:
                             await telegram_app.bot.revoke_chat_invite_link(
                                 chat_id=source_id,
@@ -519,8 +509,8 @@ async def update_managed_posts():
                             pass
 
                     failures.append(
-                        f"{source['title']} → {destination['title']}: "
-                        f"{str(exc)[:150]}"
+                        f"{source['title']} -> {destination['title']}: "
+                        f"{str(exc)[:120]}"
                     )
 
         result = (
@@ -531,7 +521,7 @@ async def update_managed_posts():
 
         if failures:
             result += "\n\n<b>Errors:</b>\n" + "\n".join(
-                html.escape(x) for x in failures[:8]
+                html.escape(item) for item in failures[:8]
             )
 
         return result
@@ -588,18 +578,16 @@ async def publish_command(update, context):
 
     await update.effective_message.reply_text(
         "⚠️ Generate new invite links and update posts?",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "✅ Confirm",
-                    callback_data="publish_run",
-                ),
-                InlineKeyboardButton(
-                    "❌ Cancel",
-                    callback_data="home",
-                ),
-            ]
-        ]),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "✅ Confirm",
+                callback_data="publish_run",
+            ),
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data="home",
+            ),
+        ]]),
     )
 
 
@@ -618,7 +606,6 @@ async def button_handler(update, context):
 
     if data == "home":
         context.user_data.pop("pending_action", None)
-
         await query.edit_message_text(
             "🤖 Telegram Link Manager",
             reply_markup=main_menu(),
@@ -637,7 +624,6 @@ async def button_handler(update, context):
 
     if data == "add_source":
         context.user_data["pending_action"] = "source"
-
         await query.edit_message_text(
             "📥 Send source channel ID or public @username.\n\n"
             "Bot ko source channel mein admin banao.",
@@ -647,7 +633,6 @@ async def button_handler(update, context):
 
     if data == "add_destination":
         context.user_data["pending_action"] = "destination"
-
         await query.edit_message_text(
             "📤 Send destination channel/group ID or @username.\n\n"
             "Bot ko destination mein admin banao.",
@@ -658,7 +643,6 @@ async def button_handler(update, context):
     if data.startswith("remove_source:"):
         chat_id = int(data.split(":", 1)[1])
         remove_chat("source_chats", chat_id)
-
         title, keyboard = chat_menu("source")
         await query.edit_message_text(
             "✅ Source configuration removed.\n\n" + title,
@@ -669,7 +653,6 @@ async def button_handler(update, context):
     if data.startswith("remove_destination:"):
         chat_id = int(data.split(":", 1)[1])
         remove_chat("destination_chats", chat_id)
-
         title, keyboard = chat_menu("destination")
         await query.edit_message_text(
             "✅ Destination configuration removed.\n\n" + title,
@@ -680,29 +663,24 @@ async def button_handler(update, context):
     if data == "publish_confirm":
         await query.edit_message_text(
             "⚠️ Create fresh join-request links and update managed posts?",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "✅ Run Update",
-                        callback_data="publish_run",
-                    ),
-                    InlineKeyboardButton(
-                        "❌ Cancel",
-                        callback_data="home",
-                    ),
-                ]
-            ]),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "✅ Run Update",
+                    callback_data="publish_run",
+                ),
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data="home",
+                ),
+            ]]),
         )
         return
 
     if data == "publish_run":
-        await query.edit_message_text(
-            "⏳ Updating links. Please wait..."
-        )
+        await query.edit_message_text("⏳ Updating links. Please wait...")
 
         try:
             result = await update_managed_posts()
-
             await query.edit_message_text(
                 result,
                 parse_mode=ParseMode.HTML,
@@ -710,7 +688,6 @@ async def button_handler(update, context):
             )
         except Exception:
             logger.exception("Manual update failed")
-
             await query.edit_message_text(
                 "❌ Update failed. Check Render logs.",
                 reply_markup=main_menu(),
@@ -744,11 +721,14 @@ async def button_handler(update, context):
 
 
 # =========================================================
-# TELEGRAM STARTUP
+# STARTUP
 # =========================================================
 
 async def start_telegram():
-    global telegram_app, bot_ready
+    global telegram_app, bot_ready, startup_error
+
+    bot_ready = False
+    startup_error = None
 
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing")
@@ -763,27 +743,25 @@ async def start_telegram():
 
     init_db()
 
-    telegram_app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    telegram_app.add_handler(CommandHandler("start", start_command))
-    telegram_app.add_handler(CommandHandler("help", help_command))
-    telegram_app.add_handler(CommandHandler("status", status_command))
-    telegram_app.add_handler(CommandHandler("publish", publish_command))
-    telegram_app.add_handler(CallbackQueryHandler(button_handler))
+    # Store the shared object before awaiting initialization.
+    telegram_app = application
 
-    telegram_app.add_handler(
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("publish", publish_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             add_chat_input,
         )
     )
 
-    await telegram_app.initialize()
-    await telegram_app.start()
+    await application.initialize()
+    await application.start()
 
     webhook_options = {
         "url": f"{BASE_URL}/telegram-webhook",
@@ -794,14 +772,14 @@ async def start_telegram():
     if WEBHOOK_SECRET:
         webhook_options["secret_token"] = WEBHOOK_SECRET
 
-    await telegram_app.bot.set_webhook(**webhook_options)
+    await application.bot.set_webhook(**webhook_options)
 
     bot_ready = True
     logger.info("BOT_READY: Telegram application and webhook started")
 
 
 def telegram_thread():
-    global bot_loop, bot_ready
+    global bot_loop, bot_ready, startup_error
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -810,8 +788,9 @@ def telegram_thread():
     try:
         loop.run_until_complete(start_telegram())
         loop.run_forever()
-    except Exception:
+    except Exception as exc:
         bot_ready = False
+        startup_error = str(exc)
         logger.exception("Telegram startup failed")
 
 
@@ -821,7 +800,6 @@ def start_background_bot():
     with startup_lock:
         if startup_started:
             return
-
         startup_started = True
 
     threading.Thread(
@@ -841,33 +819,28 @@ def index():
         "service": "Telegram Link Manager",
         "status": "ok",
         "bot_ready": bot_ready,
+        "startup_error": startup_error,
         "database": "PostgreSQL",
     })
 
 
 @app.get("/health")
 def health():
+    if not bot_ready:
+        return jsonify({
+            "status": "starting",
+            "bot_ready": False,
+            "startup_error": startup_error,
+        }), 503
+
     return jsonify({
         "status": "ok",
-        "bot_ready": bot_ready,
+        "bot_ready": True,
     }), 200
 
 
 @app.post("/telegram-webhook")
 def telegram_webhook():
-    # IMPORTANT:
-    # Do not reject requests just because bot_ready is False.
-    # During a restart Telegram may retry an earlier update.
-    if telegram_app is None or bot_loop is None or not bot_loop.is_running():
-        logger.warning(
-            "Webhook unavailable: app_exists=%s loop_exists=%s loop_running=%s",
-            telegram_app is not None,
-            bot_loop is not None,
-            bot_loop.is_running() if bot_loop is not None else False,
-        )
-
-        return jsonify({"error": "Bot initializing"}), 503
-
     if WEBHOOK_SECRET:
         received = request.headers.get(
             "X-Telegram-Bot-Api-Secret-Token",
@@ -877,6 +850,23 @@ def telegram_webhook():
         if received != WEBHOOK_SECRET:
             logger.warning("Rejected webhook: invalid secret")
             return jsonify({"error": "Unauthorized"}), 401
+
+    if (
+        not bot_ready
+        or telegram_app is None
+        or bot_loop is None
+        or not bot_loop.is_running()
+    ):
+        logger.warning(
+            "Webhook unavailable: ready=%s app_exists=%s "
+            "loop_exists=%s loop_running=%s",
+            bot_ready,
+            telegram_app is not None,
+            bot_loop is not None,
+            bot_loop.is_running() if bot_loop is not None else False,
+        )
+
+        return jsonify({"error": "Bot initializing"}), 503
 
     payload = request.get_json(silent=True)
 
@@ -894,7 +884,7 @@ def telegram_webhook():
             bot_loop,
         )
 
-        future.result(timeout=5)
+        future.result(timeout=10)
 
         return jsonify({"ok": True}), 200
 
@@ -911,8 +901,16 @@ def run_update_endpoint():
     if request.headers.get("Authorization") != f"Bearer {UPDATE_SECRET}":
         return jsonify({"error": "Unauthorized"}), 401
 
-    if telegram_app is None or bot_loop is None or not bot_loop.is_running():
-        return jsonify({"error": "Bot not initialized"}), 503
+    if (
+        not bot_ready
+        or telegram_app is None
+        or bot_loop is None
+        or not bot_loop.is_running()
+    ):
+        return jsonify({
+            "error": "Bot not initialized",
+            "startup_error": startup_error,
+        }), 503
 
     try:
         future = asyncio.run_coroutine_threadsafe(
@@ -937,7 +935,7 @@ def run_update_endpoint():
 
 
 # =========================================================
-# START
+# START BOT
 # =========================================================
 
 start_background_bot()
